@@ -1,0 +1,17 @@
+# Virtual environment (DO NOT COMMIT)
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
