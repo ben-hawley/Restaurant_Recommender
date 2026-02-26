@@ -19,7 +19,11 @@ FIELD_MASK = (
     "places.priceLevel,places.types,places.primaryType"
 )
 
-EXCLUDED_TYPES = ["bakery", "cafe", "meal_takeaway"]  # guardrails for nearby-only mode
+# Nearby-only guardrails (text search can return broader things; we filter too)
+EXCLUDED_TYPES_NEARBY = ["bakery", "cafe", "meal_takeaway"]
+
+# Hard safety: don’t show results far outside search radius (Google text search can be “creative”)
+RADIUS_FUDGE = 1.2  # allow 20% slack
 
 
 # ---------------- Data models ----------------
@@ -55,6 +59,60 @@ def safe_get_name(p: Dict) -> str:
     return ((p.get("displayName") or {}) or {}).get("text", "Unknown")
 
 
+def is_restaurant(p: Dict) -> bool:
+    """
+    Hard filter: only allow places that are actually restaurants.
+    Google Text Search can return other businesses; this prevents that.
+    """
+    primary = (p.get("primaryType") or "").lower()
+    types = [t.lower() for t in (p.get("types") or [])]
+    return ("restaurant" in primary) or ("restaurant" in types)
+
+
+def distance_from_user_miles(p: Dict, user_lat: float, user_lng: float) -> Optional[float]:
+    plat = (p.get("location") or {}).get("latitude")
+    plng = (p.get("location") or {}).get("longitude")
+    if plat is None or plng is None:
+        return None
+    return haversine_miles(user_lat, user_lng, float(plat), float(plng))
+
+
+def extract_style_keywords(text: str) -> List[str]:
+    """
+    Turn free-text refinement answers into SHORT search-safe tokens.
+    We avoid passing raw natural language into Google search.
+    """
+    t = (text or "").lower()
+
+    out = []
+    # dining level
+    if "fine dining" in t or "fancy" in t or "upscale" in t:
+        out.append("upscale")
+    if "casual" in t:
+        out.append("casual")
+    if "not too fancy" in t or "not fancy" in t:
+        out.append("relaxed")
+    if "between" in t or "mid" in t or "middle" in t:
+        out.append("mid-range")
+
+    # atmosphere / vibe cues
+    if "date" in t or "romantic" in t:
+        out.append("date night")
+    if "family" in t or "kids" in t:
+        out.append("family friendly")
+    if "outdoor" in t or "patio" in t:
+        out.append("outdoor patio")
+
+    # keep it short + dedup
+    seen = set()
+    cleaned = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            cleaned.append(s)
+    return cleaned[:6]  # keep it small
+
+
 # ---------------- Google API calls (cached) ----------------
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def geocode(api_key: str, where: str) -> Tuple[float, float]:
@@ -72,11 +130,9 @@ def places_nearby(api_key: str, lat: float, lng: float, radius_m: int, max_resul
     headers = {"Content-Type": "application/json", "X-Goog-Api-Key": api_key, "X-Goog-FieldMask": FIELD_MASK}
     body = {
         "includedTypes": ["restaurant"],
-        "excludedTypes": EXCLUDED_TYPES,
+        "excludedTypes": EXCLUDED_TYPES_NEARBY,
         "maxResultCount": min(max_results, 20),
-        "locationRestriction": {
-            "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(radius_m)}
-        },
+        "locationRestriction": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(radius_m)}},
     }
     r = requests.post(PLACES_NEARBY_URL, headers=headers, json=body, timeout=20)
     if r.status_code != 200:
@@ -90,9 +146,7 @@ def places_text_search(api_key: str, query: str, lat: float, lng: float, radius_
     body = {
         "textQuery": query,
         "maxResultCount": min(max_results, 20),
-        "locationBias": {
-            "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(radius_m)}
-        },
+        "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(radius_m)}},
     }
     r = requests.post(PLACES_TEXT_SEARCH_URL, headers=headers, json=body, timeout=20)
     if r.status_code != 200:
@@ -105,12 +159,8 @@ def score_place(p: Dict, prefs: UserPrefs, user_lat: float, user_lng: float) -> 
     rating = float(p.get("rating") or 0.0)
     nratings = int(p.get("userRatingCount") or 0)
 
-    plat = (p.get("location") or {}).get("latitude")
-    plng = (p.get("location") or {}).get("longitude")
-    if plat is None or plng is None:
-        distance_miles = 999.0
-    else:
-        distance_miles = haversine_miles(user_lat, user_lng, float(plat), float(plng))
+    dist = distance_from_user_miles(p, user_lat, user_lng)
+    distance_miles = dist if dist is not None else 999.0
 
     name = safe_get_name(p)
     types = " ".join(p.get("types") or []) + " " + str(p.get("primaryType") or "")
@@ -123,7 +173,7 @@ def score_place(p: Dict, prefs: UserPrefs, user_lat: float, user_lng: float) -> 
     s_rating = rating * 2.0
     s_pop = math.log1p(nratings) * 0.6
     s_dist = -distance_miles * 1.0
-    s_match = match * 4.0  # stronger matching signal
+    s_match = match * 4.0
 
     total = s_rating + s_pop + s_dist + s_match
     return total, {"rating": s_rating, "popularity": s_pop, "distance": s_dist, "match": s_match}
@@ -135,10 +185,9 @@ def reason_line(p: Dict, parts: Dict[str, float], prefs: UserPrefs, user_lat: fl
         bits.append(f"matches “{prefs.keywords.strip()}”")
     if p.get("rating") is not None:
         bits.append(f"{p.get('rating')}★ ({p.get('userRatingCount', 0)} ratings)")
-    plat = (p.get("location") or {}).get("latitude")
-    plng = (p.get("location") or {}).get("longitude")
-    if plat is not None and plng is not None:
-        bits.append(f"{haversine_miles(user_lat, user_lng, plat, plng):.1f} mi away")
+    dist = distance_from_user_miles(p, user_lat, user_lng)
+    if dist is not None:
+        bits.append(f"{dist:.1f} mi away")
     return " • ".join(bits)
 
 
@@ -153,22 +202,16 @@ def get_openai_client() -> Optional[OpenAI]:
 
 
 def simplify_place_for_llm(p: Dict, user_lat: float, user_lng: float) -> Dict:
-    name = safe_get_name(p)
-    plat = (p.get("location") or {}).get("latitude")
-    plng = (p.get("location") or {}).get("longitude")
-    dist = None
-    if plat is not None and plng is not None:
-        dist = round(haversine_miles(user_lat, user_lng, float(plat), float(plng)), 2)
-
+    dist = distance_from_user_miles(p, user_lat, user_lng)
     return {
-        "name": name,
+        "name": safe_get_name(p),
         "address": p.get("formattedAddress", ""),
         "rating": p.get("rating", None),
         "userRatingCount": p.get("userRatingCount", None),
         "priceLevel": p.get("priceLevel", None),
         "primaryType": p.get("primaryType", None),
         "types": p.get("types", []),
-        "distanceMiles": dist,
+        "distanceMiles": (None if dist is None else round(dist, 2)),
     }
 
 
@@ -195,7 +238,7 @@ def openai_explain_recs(
     client: OpenAI,
     prefs: UserPrefs,
     candidates: List[Dict],
-    model: str = "gpt-4.1",  # stronger model than mini
+    model: str = "gpt-4.1",
 ) -> Optional[Dict]:
     payload = {
         "user_preferences": {
@@ -214,7 +257,8 @@ def openai_explain_recs(
     system = (
         "You are a helpful restaurant recommender. "
         "Return STRICT JSON only (no markdown, no extra text). "
-        "Be concise and align explanations to the shown candidates by name."
+        "Ask at most one short follow-up question if it would materially improve recommendations. "
+        "Do NOT suggest non-restaurants."
     )
 
     resp = client.responses.create(
@@ -229,7 +273,7 @@ def openai_explain_recs(
     return _extract_json_object(resp.output_text)
 
 
-# ---------------- Compute + store results (key fix for Streamlit reruns) ----------------
+# ---------------- Compute + store results ----------------
 def compute_and_store_results(
     google_key: str,
     openai_client: Optional[OpenAI],
@@ -237,43 +281,54 @@ def compute_and_store_results(
     use_ai: bool,
     model_choice: str,
 ):
-    lat, lng = geocode(google_key, prefs.where)
+    user_lat, user_lng = geocode(google_key, prefs.where)
     radius_m = miles_to_meters(prefs.radius_miles)
 
-    # KEY CHANGE: Use Text Search when keywords exist for much better relevance
+    # Better relevance: use Text Search when keywords exist; Nearby when they don't.
     if prefs.keywords.strip():
         query = f"{prefs.keywords.strip()} restaurant"
-        places = places_text_search(google_key, query, lat, lng, radius_m, prefs.max_results)
+        places = places_text_search(google_key, query, user_lat, user_lng, radius_m, prefs.max_results)
     else:
-        places = places_nearby(google_key, lat, lng, radius_m, prefs.max_results)
+        places = places_nearby(google_key, user_lat, user_lng, radius_m, prefs.max_results)
+
+    # HARD FILTERS: restaurant-only + distance sanity
+    places = [p for p in places if is_restaurant(p)]
+
+    max_dist = prefs.radius_miles * RADIUS_FUDGE
+    pruned = []
+    for p in places:
+        d = distance_from_user_miles(p, user_lat, user_lng)
+        if d is not None and d <= max_dist:
+            pruned.append(p)
+    places = pruned
 
     if not places:
         st.session_state["results"] = {
             "prefs": prefs,
-            "lat": lat,
-            "lng": lng,
+            "lat": user_lat,
+            "lng": user_lng,
             "top5": [],
             "ai_data": None,
-            "error": "No restaurants found. Try increasing radius or changing location/keywords.",
+            "error": "No restaurants found after filtering. Try increasing radius or changing keywords.",
         }
         return
 
     scored = []
     for p in places:
-        total, parts = score_place(p, prefs, lat, lng)
+        total, parts = score_place(p, prefs, user_lat, user_lng)
         scored.append((total, p, parts))
     scored.sort(key=lambda x: x[0], reverse=True)
     top5 = scored[:5]
 
     ai_data = None
     if use_ai and openai_client is not None:
-        simplified = [simplify_place_for_llm(p, lat, lng) for (_, p, _) in top5]
+        simplified = [simplify_place_for_llm(p, user_lat, user_lng) for (_, p, _) in top5]
         ai_data = openai_explain_recs(openai_client, prefs, simplified, model=model_choice)
 
     st.session_state["results"] = {
         "prefs": prefs,
-        "lat": lat,
-        "lng": lng,
+        "lat": user_lat,
+        "lng": user_lng,
         "top5": top5,
         "ai_data": ai_data,
         "error": None,
@@ -307,7 +362,7 @@ if "should_run" not in st.session_state:
 if "active_keywords" not in st.session_state:
     st.session_state["active_keywords"] = ""
 
-# Preferences form
+
 with st.form("prefs"):
     where = st.text_input("Where are you?", value="Los Angeles, CA")
     keywords_in = st.text_input("Cuisine or vibe keywords", value="tacos outdoor patio")
@@ -319,7 +374,7 @@ with st.form("prefs"):
 
     submit = st.form_submit_button("Recommend")
 
-# Active keywords display + clear button
+# Active keywords display + clear
 active_kw = st.session_state["active_keywords"].strip() or keywords_in.strip()
 col_a, col_b = st.columns([1, 1])
 with col_a:
@@ -332,12 +387,11 @@ with col_b:
         st.session_state["should_run"] = False
         st.rerun()
 
-# Trigger a run when the form is submitted
 if submit:
     st.session_state["active_keywords"] = keywords_in.strip()
     st.session_state["should_run"] = True
 
-# Compute step (runs on submit OR refine, then stores results)
+# Compute step
 if st.session_state["should_run"]:
     if not google_key:
         st.error("Missing Google Maps API key.")
@@ -365,43 +419,47 @@ if st.session_state["should_run"]:
 
     st.session_state["should_run"] = False
 
-# Render (always from session_state so results persist across reruns)
+# Render from session state
 res = st.session_state.get("results")
 if res:
     if res.get("error"):
         st.info(res["error"])
     else:
         prefs: UserPrefs = res["prefs"]
-        lat, lng = res["lat"], res["lng"]
+        user_lat, user_lng = res["lat"], res["lng"]
         top5 = res["top5"]
         ai_data = res.get("ai_data")
 
-        # AI summary + follow-up question with working answer loop
         why_by_name = {}
+        follow_question = None
+
         if isinstance(ai_data, dict):
             summary = ai_data.get("summary")
-            follow = ai_data.get("follow_up_question")
+            follow_question = ai_data.get("follow_up_question")
             why_by_name = ai_data.get("why_by_name") if isinstance(ai_data.get("why_by_name"), dict) else {}
 
             if isinstance(summary, str) and summary.strip():
                 st.info(summary.strip())
 
-            if isinstance(follow, str) and follow.strip():
-                st.write("**Quick question to refine this further:**")
-                st.write(follow.strip())
+        # Follow-up refinement UI (safe keyword extraction)
+        if isinstance(follow_question, str) and follow_question.strip():
+            st.write("**Quick question to refine this further:**")
+            st.write(follow_question.strip())
 
-                st.session_state["follow_answer"] = st.text_input(
-                    "Your answer",
-                    value=st.session_state["follow_answer"],
-                    key="follow_answer_box",
-                )
+            st.session_state["follow_answer"] = st.text_input(
+                "Your answer",
+                value=st.session_state["follow_answer"],
+                key="follow_answer_box",
+            )
 
-                if st.button("Refine recommendations"):
-                    ans = st.session_state["follow_answer"].strip()
-                    if ans:
-                        st.session_state["active_keywords"] = (prefs.keywords + " " + ans).strip()
-                        st.session_state["should_run"] = True
-                    st.rerun()
+            if st.button("Refine recommendations"):
+                ans = st.session_state["follow_answer"].strip()
+                if ans:
+                    style_terms = extract_style_keywords(ans)
+                    # append only safe, short tokens (NOT raw prose)
+                    st.session_state["active_keywords"] = (prefs.keywords + " " + " ".join(style_terms)).strip()
+                    st.session_state["should_run"] = True
+                st.rerun()
 
         st.success(f"Top picks near {prefs.where}:")
 
@@ -416,7 +474,7 @@ if res:
             if isinstance(ai_why, str) and ai_why.strip():
                 st.caption(ai_why.strip())
             else:
-                st.caption(reason_line(p, parts, prefs, lat, lng))
+                st.caption(reason_line(p, parts, prefs, user_lat, user_lng))
 
             st.divider()
 else:
